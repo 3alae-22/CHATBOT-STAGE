@@ -1,7 +1,5 @@
 from google.genai import types
 
-from app.services.retrieval_service import RetrievalService
-
 
 INSTRUCTIONS = '''
 You are an assistant that answers administrative questions based solely on excerpts from official Moroccan legal texts.
@@ -28,12 +26,10 @@ class GenerationService:
     def __init__(
         self,
         llm_client,
-        retrieval_service: RetrievalService,
         model: str = 'gemini-2.5-flash',
         instruction: str = INSTRUCTIONS,
         prompt_template: str = USER_PROMPT_TEMPLATE,
     ):
-        self.retrieval_service = retrieval_service
         self.llm_client = llm_client
         self.model = model
         self.instruction = instruction
@@ -42,7 +38,7 @@ class GenerationService:
     def build_context(self, search_results) -> str:
         lines = []
         for i, row in enumerate(search_results, start=1):
-            _, pdf_name, page_num, chunk_text, distance = row
+            _, pdf_name, page_num, chunk_text, *_ = row
             lines.append(f"[Source {i} — {pdf_name}, page {page_num}]")
             lines.append(chunk_text.strip())
             lines.append("")
@@ -54,7 +50,6 @@ class GenerationService:
         return prompt.strip()
 
     def generate(self, prompt: str) -> str:
-
         response = self.llm_client.models.generate_content(
             model=self.model,
             contents=prompt,
@@ -62,9 +57,8 @@ class GenerationService:
         )
         return response.text
 
-    def ask(self, question: str, k: int = 5) -> dict:
-
-        search_results = self.retrieval_service.search(question, k=k)
+    def ask(self, question: str, search_results: list[tuple]) -> dict:
+        
         prompt = self.build_prompt(question, search_results)
         answer = self.generate(prompt)
 
@@ -73,6 +67,3 @@ class GenerationService:
             for row in search_results
         ]
         return {"answer": answer, "sources": sources}
-
-
-    

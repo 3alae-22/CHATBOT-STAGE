@@ -23,6 +23,45 @@ def test_generate_uses_instance_model_and_instruction(mock_gemini_client):
     assert kwargs["config"].system_instruction == "CUSTOM INSTRUCTION"
 
 
+def test_build_context_formats_sources_correctly(fake_search_results):
+    from unittest.mock import MagicMock
+    from app.services.generation_service import GenerationService
+
+    service = GenerationService(
+        llm_client=MagicMock(),
+        retrieval_service=MagicMock(),
+    )
+
+    context = service.build_context(fake_search_results)
+
+    assert "[Source 1 — Decret_marches_publics_n_2_22_431, page 13]" in context
+    assert "Le marché public est un contrat administratif." in context
+    assert "[Source 3 — qanoun_wadifa_omoumia, page 19]" in context
+    assert context.count("[Source") == 3
+    
+
+def test_ask_handles_empty_search_results(mock_gemini_client):
+    from unittest.mock import MagicMock
+    from app.services.generation_service import GenerationService
+
+    mock_retrieval = MagicMock()
+    mock_retrieval.search.return_value = []
+
+    mock_gemini_client.models.generate_content.return_value.text = (
+        "Je ne trouve pas cette information dans les documents fournis."
+    )
+
+    service = GenerationService(
+        llm_client=mock_gemini_client,
+        retrieval_service=mock_retrieval,
+    )
+
+    result = service.ask("Quelle est la recette du tajine ?", k=5)
+
+    assert result["sources"] == []
+    assert "ne trouve pas" in result["answer"]
+
+
 def test_build_prompt_formats_question_and_context(fake_search_results):
 
     mock_llm_client = MagicMock()

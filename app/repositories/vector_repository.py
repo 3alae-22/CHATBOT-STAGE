@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -35,9 +37,35 @@ class VectorRepository:
                     pdf_name TEXT NOT NULL,
                     page_num INTEGER NOT NULL,
                     chunk_text TEXT NOT NULL,
+                    contextualized_text TEXT,
                     lang TEXT NOT NULL,
                     embedding VECTOR(1024)
                 );
+            """)
+            cur.execute("""
+                ALTER TABLE dev.chunks
+                ADD COLUMN IF NOT EXISTS contextualized_text TEXT;
+            """)
+            cur.execute("""
+                UPDATE dev.chunks
+                SET contextualized_text = chunk_text
+                WHERE contextualized_text IS NULL;
+            """)
+            cur.execute("""
+                ALTER TABLE dev.chunks
+                ADD COLUMN IF NOT EXISTS source_method TEXT NOT NULL DEFAULT 'native';
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dev.extracted_tables (
+                    id SERIAL PRIMARY KEY,
+                    chunk_id INTEGER NOT NULL REFERENCES dev.chunks(id) ON DELETE CASCADE,
+                    table_json JSONB NOT NULL,
+                    created_at TIMESTAMP NOT NULL DEFAULT now()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_extracted_tables_chunk_id
+                ON dev.extracted_tables(chunk_id);
             """)
         self.conn.commit()
 
@@ -49,7 +77,7 @@ class VectorRepository:
             """, (pdf_name, page_num))
             return cur.fetchone()[0] > 0
 
-    def search_similar(self, embedding: np.ndarray, k: int = 5, lang: str | None = None):
+    def search_similar(self, embedding: np.ndarray, k: int = 5, lang: str | None = None) -> list[tuple]:
         with self.conn.cursor() as cur:
             if lang:
                 cur.execute("""
@@ -70,12 +98,27 @@ class VectorRepository:
                 """, (embedding, embedding, k))
             return cur.fetchall()
 
+    def search_lexical(self, query: str, lang: str, k: int = 10) -> list[tuple]:
+        ts_config = "french" if lang == "fr" else "simple"
+        with self.conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT id, pdf_name, page_num, chunk_text,
+                    ts_rank(to_tsvector(%s, contextualized_text), plainto_tsquery(%s, %s)) AS rank
+                FROM dev.chunks
+                WHERE lang = %s
+                AND to_tsvector(%s, contextualized_text) @@ plainto_tsquery(%s, %s)
+                ORDER BY rank DESC
+                LIMIT %s;
+            """, (ts_config, ts_config, query, lang, ts_config, ts_config, query, k))
+            return cur.fetchall()
+
     def insert_chunks(self, chunks: list[dict], embeddings: list) -> int:
         rows = [
             (
                 chunks[i]["pdf_name"],
                 chunks[i]["page_num"],
                 chunks[i]["chunk"],
+                chunks[i]["contextualized_text"],
                 chunks[i]["lang"],
                 np.array(embeddings[i], dtype=np.float32),
             )
@@ -83,8 +126,48 @@ class VectorRepository:
         ]
         with self.conn.cursor() as cur:
             cur.executemany("""
-                INSERT INTO dev.chunks(pdf_name, page_num, chunk_text, lang, embedding)
-                VALUES (%s, %s, %s, %s, %s);
+                INSERT INTO dev.chunks(pdf_name, page_num, chunk_text, contextualized_text, lang, embedding)
+                VALUES (%s, %s, %s, %s, %s, %s);
             """, rows)
         self.conn.commit()
         return len(rows)
+
+    def insert_chunk_with_source(
+        self,
+        pdf_name: str,
+        page_num: int,
+        chunk_text: str,
+        contextualized_text: str,
+        lang: str,
+        embedding,
+        source_method: str = "native",
+    ) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO dev.chunks(pdf_name, page_num, chunk_text, contextualized_text, lang, embedding, source_method)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+            """, (pdf_name, page_num, chunk_text, contextualized_text, lang,
+                  np.array(embedding, dtype=np.float32), source_method))
+            chunk_id = cur.fetchone()[0]
+        self.conn.commit()
+        return chunk_id
+
+    def insert_extracted_table(self, chunk_id: int, table_json: list[dict]) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO dev.extracted_tables(chunk_id, table_json)
+                VALUES (%s, %s)
+                RETURNING id;
+            """, (chunk_id, json.dumps(table_json, ensure_ascii=False)))
+            table_id = cur.fetchone()[0]
+        self.conn.commit()
+        return table_id
+
+    def get_table_for_chunk(self, chunk_id: int) -> list[dict] | None:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_json FROM dev.extracted_tables WHERE chunk_id = %s;
+            """, (chunk_id,))
+            row = cur.fetchone()
+        return row[0] if row else None
